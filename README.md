@@ -176,7 +176,7 @@ Codex 元数据检查支持字符串、字节、Blob 和 `Request` 副本，最�
 
 请求头必须是名称合法、值为字符串的 JSON 对象；拒绝换行、NUL，以及认证和连接管理保留头。`Authorization`、`X-API-Key`、`X-Goog-API-Key` 等不允许在额外请求头中设置，请使用账号的 API key。`Host`、`Content-Length`、`Connection`、`Transfer-Encoding`、`Upgrade`、`Keep-Alive`、`TE`、`Trailer`、代理认证/连接头及 `Accept-Encoding` 也由客户端管理。
 
-插件始终使用当前账号的 API key，避免调用方认证头覆盖账号。Anthropic 同时设置 `x-api-key`，并在未指定时补充 `anthropic-version`；Gemini 设置 `x-goog-api-key`，不携带调用方传入的 URL `key` 参数。请求头校验错误不包含其值。实际模型请求仅限账号站点的相同 origin 和已配置协议路径（含部署前缀），所有请求禁止跟随重定向，以免 key 或附加头被转发到其他地址。
+插件始终使用当前账号的 API key，避免调用方认证头覆盖账号。Anthropic 同时设置 `x-api-key`，并在未指定时补充 `anthropic-version`；Gemini 设置 `x-goog-api-key`；已识别的四类推理接口均移除调用方 URL 中的 `key` / `api_key` 参数，避免认证来源混杂或 Sub2API 拒绝旧查询参数。请求头校验错误不包含其值。实际模型请求仅限账号站点的相同 origin 和已配置协议路径（含部署前缀），所有请求禁止跟随重定向，以免 key 或附加头被转发到其他地址。
 
 站点地址禁止包含 URL 用户名、密码、查询串或 fragment。允许 HTTP 以便本地开发，生产环境请使用 HTTPS。若站点返回重定向，请配置最终 API 地址。
 
@@ -250,6 +250,32 @@ Magpie 的账号级 `baseURL` 优先于模型地址，因此发送函数还会�
 - 模型刷新保留 Magpie 已知的上下文、输出限制、价格、能力、选项和模型请求头；重新确定当前账号的 API 地址、模型 ID 和 SDK。未知价格不再填成零，未知视觉或推理能力不直接按协议判定。
 - 模型查询失败直接抛出错误，不返回宿主默认列表、其他账号列表或过期列表作为成功刷新。普通目录错误会短暂阻断该账号已有发送函数：成功刷新可立即恢复，否则错误在 30 秒后解除；到期只清除错误，保留最近成功目录的模型 ID 和档位（若存在），继续进行模型核对和旧速度 ID 归一化，不重新查询或返回旧目录。首次查询尚未成功时没有这些目录元数据。401 登录失效不会随这 30 秒自动解除，必须由失效后新启动的成功模型刷新恢复；较早的在途刷新不能覆盖较新的目录或清除较新的登录失效状态。不为模型核对消费流式上传。
 - 实际模型请求只发送一次，除下述旧速度 ID 的发送前兼容转换外保持请求模型不变，原样返回上游状态、响应流或网络错误；插件不做重试、不换模型、不换 key。Magpie 自身的路由组或 provider fallback 是宿主配置，本插件不修改它们；需要端到端禁止模型回退时，请清空宿主的备用模型并直接选择 `sub2api/<模型>` 或独立站点模型。需要固定某个 key 时，可由客户端向 Magpie 发送 `X-Magpie-Account: <账号名或 ID>`，不要把它配置成发给站点的额外请求头。
+
+### 同一地址、不同 key 的模型测试排障
+
+同一 Base URL 下登录多个 key 是支持的；地址相同不代表必须共用凭据。需要区分 **Magpie 界面的账号模型勾选** 与 **该 key 实际返回的模型目录**：前者限制宿主向哪个账号分发，后者来自该 key 的 `/v1/models`（再应用插件筛选）。勾选不能把另一个 key 的模型加入当前 key 的目录或授予权限。
+
+遇到 `The selected model is not listed for this Sub2API account` 时：
+
+- 这是插件的**本地发送前拦截**，说明本次请求模型 ID 不在所选账号最近成功获取并筛选后的目录中；这条错误不是 Sub2API 的 HTTP 400，也不表示 key 已失效。宿主可能将本地失败呈现为其他状态，请以这一条记录的错误详情为准。
+- 优先核对测试/请求选中的账号、它的 key 与分组，以及发送的完整模型 ID；同时检查 `includeModels` / `excludeModels`、旧合成速度 ID 和宿主自定义模型 ID。错误本身不能区分误选 key、旧目录与 ID 不一致，不能仅凭 400 或“订阅账号”标签确定原因。
+- 先保存账号勾选，再重载插件并重新获取模型；必要时等待默认 60 秒模型缓存到期，或临时设 `{"query":{"modelsTtlMs":0}}` 后重载、获取，排障完成后恢复默认。可临时只启用一个目标账号测试，分别验证 Claude/Gemini/GPT；插件不会自动替换 key 或绕过检查。
+- Magpie 的旧测试路径曾有“总用第一个账号”的 [#4992](https://github.com/yetone/magpie/issues/4992)。但 **v0.1.3754 已包含该测试账号选择逻辑和回归用例**（[源码](https://github.com/yetone/magpie/blob/v0.1.3754/internal/provider/test.go)、[测试](https://github.com/yetone/magpie/blob/v0.1.3754/internal/provider/test_account_route_test.go)），不能仅凭类似症状认定仍是该旧问题；还需验证当前安装和实际账号目录。
+- 开启 `diagnostics: true` 后，`models.ready`、`inference.route`、`inference.model_rejected` 等事件携带同一凭据作用域的 12 位摘要 `accountRef`。本地模型拒绝另含 `source`（`body` 或 `path`）和 `catalogModels`，用于区分目录与发送事件，不记录账号名、key 后缀、模型 ID 或任何正文。`accountRef` 只是日志关联标识，不参与路由，也不加入请求 URL。原生 Gemini 从 URL 校验模型，不为此读取上传正文。
+
+若只启用目标账号后相同模型即可成功，说明该组合在当次测试中可用，多账号选择/映射或其缓存应优先排查，不必先怀疑此 key 永远无权限。可使用已有的独立站点 provider **明确隔离 key**，而不是修改 URL 或在插件内偷偷换 key。`sites` 可以使用同一地址，只要 `id` 不同；每个 provider 只登录它自己的 key：
+
+```json
+{
+  "sites": [
+    {"id":"my-gpt","name":"GPT key","url":"https://api.example.com","protocol":"responses"},
+    {"id":"my-claude","name":"Claude key","url":"https://api.example.com","protocol":"anthropic"},
+    {"id":"my-gemini","name":"Gemini key","url":"https://api.example.com","protocol":"gemini"}
+  ]
+}
+```
+
+分别登录 `my-gpt` / `my-claude` / `my-gemini`，并直接选择对应的 `provider/模型`；避免同时继续从池化 `sub2api` 或其他回退组发起验证。上述协议须与站点实际开放的接口一致。此方式可避开同一池的账号选择歧义，但不能修复上游缺失模型、权限不足或协议不兼容；不自动迁移已有登录或修改宿主配置。
 
 ### 可选筛选、名称和能力覆盖
 
@@ -362,7 +388,7 @@ Magpie 选择账号后，上游收到的 `model` 是 `gpt-example`，速度参�
 - 普通查询超时和思考等级查询超时分别可设为 1–60000 毫秒；JSON 大小可设为 1 字节到 64 MiB，默认 4 MiB，并检查声明长度和实际读取长度。
 - 只有含 Responses 模型的列表才查询 Codex manifest，默认最多额外等 15 秒，避免较慢站点的能力查询被误降级为三个默认等级且不显示 Fast；非 401 失败后 30 秒内不重复探测，保留已知思考等级。图标发现和模型发现互不阻塞。
 - 当前模型刷新或用量查询观察到的 401 会标记需要登录，不影响其他 key；独立用量查询后到的 401 仍生效，不会被先完成的模型刷新忽略。每次普通目录错误阻断推理 30 秒，缓存命中不会延长该期限；被较新模型刷新替代的旧结果不能重建过时错误。401 会清除该凭据作用域的查询缓存，其他失败不作为成功缓存，没有管理查询或计费请求的自动重试。
-- 开启 `diagnostics: true` 可查看固定事件名、协议、耗时、数量、缓存命中和 HTTP 状态。日志不包含账号名、模型名、站点 URL、请求体、响应体或请求头值。管理接口错误不回显站点返回的内容，避免反射密钥。
+- 开启 `diagnostics: true` 可查看固定事件名、协议、耗时、数量、缓存命中和 HTTP 状态，并通过凭据作用域的摘要 `accountRef` 关联目录与发送。`inference.model_rejected` 表示本地模型/账号不匹配，含模型来源和目录数量，不代表上游返回 HTTP 错误。日志不包含账号名、模型名、站点 URL、请求体、响应体或请求头值。管理接口错误不回显站点返回的内容，避免反射密钥。
 
 ## 请求指标
 

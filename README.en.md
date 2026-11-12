@@ -150,7 +150,7 @@ Override misleading model names with `modelProtocols`, a map of exact full model
 
 Set `apiPaths` to override the base path for each protocol, e.g. `{"apiPaths":{"anthropic":"/antigravity/v1","gemini":"/antigravity/v1beta"}}`. Paths are relative to the Sub2API site root, may include a deployment prefix, and must not contain the final operation (`messages`, `responses`, etc.), an external origin, traversal or query string. `/` means the site root. Management endpoints remain `/v1/models` and `/v1/usage` under that root.
 
-The loader's base URL overrides per-model URLs in Magpie; the account fetch function therefore resolves the operation's protocol and selects the final path, including native Gemini `/v1beta/`. Only the account origin and configured API paths are allowed. Anthropic gets the selected account's `x-api-key` and a default `anthropic-version` when absent. Gemini gets `x-goog-api-key`, and caller-provided query-string `key` values are removed. These settings are also available in account metadata as `protocol`, `modelProtocols` and `apiPaths`; reload the account and model list after changing them.
+The loader's base URL overrides per-model URLs in Magpie; the account fetch function therefore resolves the operation's protocol and selects the final path, including native Gemini `/v1beta/`. Only the account origin and configured API paths are allowed. Anthropic gets the selected account's `x-api-key` and a default `anthropic-version` when absent. Gemini gets `x-goog-api-key`. All four recognized inference protocols remove caller-provided query-string `key` and `api_key` credentials, avoiding conflicting authentication sources or Sub2API's deprecated-query rejection. These settings are also available in account metadata as `protocol`, `modelProtocols` and `apiPaths`; reload the account and model list after changing them.
 
 ## Complete Catalogs and Multiple Keys
 
@@ -162,6 +162,32 @@ Every API-key sign-in is a separate account. Its `/v1/models` request uses that 
 - Refreshes preserve known context/output limits, prices, capabilities, options and model headers, while rebuilding the current account's model identity, SDK and API address. Unknown prices are omitted instead of set to zero; protocol alone does not determine vision or reasoning support.
 - Failed discovery throws; it never returns host defaults, another account's list or an old catalog as a successful refresh. An ordinary catalog error blocks an existing account transport for at most 30 seconds unless a successful refresh restores it sooner. Expiry clears only that error, retaining IDs and tiers from the last successful catalog, when available, for model checks and legacy speed-ID normalization; it neither requeries nor returns an old catalog. No catalog metadata exists before the first successful discovery. A 401 remains blocking until a successful model refresh started after that invalidation; older in-flight refreshes cannot overwrite a newer catalog or clear newer sign-in expiry. Streaming uploads are not consumed for model checks.
 - Inference sends once and leaves the model unchanged except for the pre-send legacy speed-ID normalization described below, returning the original response/status/stream or network error. The plugin does not retry, switch keys or substitute models. Host routing groups and provider fallbacks remain Magpie settings, not settings this plugin rewrites. To forbid model fallback end to end, clear host fallback models and select `sub2api/<model>` or a site model directly. To pin a key, clients can send `X-Magpie-Account: <account name or ID>` to Magpie; do not configure it as an extra upstream header.
+
+### Troubleshooting model tests with several keys at one address
+
+Several accounts may share the same Base URL; they do not need to share credentials. Distinguish **Magpie's per-account model picks** (which account the host may route to) from **the key's own catalog**, fetched with that key from `/v1/models` and then filtered by the plugin. Ticking a model does not add it to a key's catalog or grant upstream permissions.
+
+For `The selected model is not listed for this Sub2API account`:
+
+- This is a **local pre-send rejection**, not Sub2API's HTTP 400 or an expired-key finding. The selected account's last successfully fetched and filtered catalog lacks the requested model ID. The host may display local failures under a different status; read that attempt's error details.
+- Check the chosen account, its actual key/group and exact wire model ID, as well as `includeModels` / `excludeModels`, old synthetic speed IDs and host-defined model IDs. This message alone cannot distinguish a wrong account from an old catalog or a mismatched ID; neither HTTP 400 nor a subscription badge proves the cause.
+- Save account picks, reload the plugin and fetch models again. Let the default 60-second model cache expire, or temporarily reload with `{"query":{"modelsTtlMs":0}}` and fetch, restoring defaults after diagnosis. Temporarily enabling only the intended account helps verify Claude/Gemini/GPT separately. The plugin never switches keys or bypasses the check to make a test pass.
+- Magpie's old test path had an always-first-account issue, [#4992](https://github.com/yetone/magpie/issues/4992). **v0.1.3754 already contains the account-selection logic and regressions** ([source](https://github.com/yetone/magpie/blob/v0.1.3754/internal/provider/test.go), [tests](https://github.com/yetone/magpie/blob/v0.1.3754/internal/provider/test_account_route_test.go)); similar symptoms do not prove that old issue still applies. Verify the installed host and actual per-account catalogs.
+- With `diagnostics: true`, events including `models.ready`, `inference.route` and `inference.model_rejected` carry a 12-hex `accountRef` digest of the credential scope. Local model rejections also carry `source` (`body` or `path`) and `catalogModels`. This correlates discovery and sends without logging account names, key suffixes, model IDs or bodies. The reference never selects accounts or changes routing URLs. Native Gemini validates its URL model without reading the upload body.
+
+If the same model succeeds with only its intended account enabled, that combination worked in that attempt: prioritize multi-account selection/mappings or their caches, rather than assuming the key never has permission. Use the existing separate site providers to **isolate keys explicitly**, rather than synthetic URLs or hidden key substitution. Site URLs may be identical when their IDs differ; sign in each provider with only its intended key:
+
+```json
+{
+  "sites": [
+    {"id":"my-gpt","name":"GPT key","url":"https://api.example.com","protocol":"responses"},
+    {"id":"my-claude","name":"Claude key","url":"https://api.example.com","protocol":"anthropic"},
+    {"id":"my-gemini","name":"Gemini key","url":"https://api.example.com","protocol":"gemini"}
+  ]
+}
+```
+
+Sign in to `my-gpt`, `my-claude` and `my-gemini` separately and select the corresponding `provider/model` directly, not the pooled `sub2api` or a fallback group, for verification. Protocols must match the site's actual endpoints. Separate providers avoid ambiguity within one pool, not missing upstream models, permissions or protocol incompatibility. No existing sign-in is migrated and no host configuration is changed automatically.
 
 ### Optional Filters and Metadata Overrides
 
@@ -268,7 +294,7 @@ Management queries have bounded bodies, timeouts and same-account concurrent req
 - Query and reasoning timeouts accept 1-60000 milliseconds. JSON size accepts 1 byte to 64 MiB, default 4 MiB, checking both declared and actually read sizes.
 - Only catalogs containing Responses models query the Codex manifest, with a separate 15-second budget by default so slower sites do not lose reported reasoning levels and Fast capabilities. Non-401 failed probes are cached for 30 seconds; known reasoning levels survive. Account icon discovery does not delay model discovery.
 - A current model refresh or independent usage query returning HTTP 401 marks that account expired; other keys are unaffected. A usage 401 observed after model success still applies. Each ordinary catalog error blocks inference for 30 seconds and cache hits do not extend it; superseded model results cannot restore obsolete errors. A 401 clears that credential scope's query cache. Other required-query failures are not success-cached. Neither management queries nor billable inference requests automatically retry.
-- `diagnostics: true` emits fixed event names, protocols, timings, counts, cache hits and HTTP status codes. Logs contain no account/model names, site URLs, bodies or header values. Management errors do not echo upstream bodies, which might reflect credentials.
+- `diagnostics: true` emits fixed event names, protocols, timings, counts, cache hits and HTTP status codes, with a credential-scope `accountRef` digest to correlate catalogs and sends. `inference.model_rejected` is a local model/account mismatch carrying the model source and catalog count, not an upstream HTTP refusal. Logs contain no account/model names, site URLs, bodies or header values. Management errors do not echo upstream bodies, which might reflect credentials.
 
 ## Request Metrics
 

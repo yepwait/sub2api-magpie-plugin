@@ -362,8 +362,8 @@ function diagnostics(...layers) {
     if (typeof layer.diagnostics !== "boolean") throw new Error("diagnostics must be a boolean")
     enabled = layer.diagnostics
   }
-  // Only fixed event names, status codes and timings reach stderr, never URLs,
-  // account names, model names, response bodies or headers.
+  // Only fixed event names, status codes, timings, counts and opaque account
+  // references reach stderr, never URLs, names, keys, bodies or header values.
   return (event, details = {}) => {
     if (enabled) console.error("sub2api-magpie-plugin: " + JSON.stringify({ event, ...details }))
   }
@@ -377,6 +377,13 @@ function cacheSet(cache, key, value) {
 
 function accountScope(base, key, headers) {
   return fingerprint(base, key, Object.entries(headers).sort(([a], [b]) => a.localeCompare(b)))
+}
+
+function modelAccountMismatch(state, protocol, source, report) {
+  report("inference.model_rejected", { protocol: protocol ?? "unknown", source, catalogModels: state.ids.size })
+  const error = new Error("The selected model is not listed for this Sub2API account; the request was stopped locally before contacting Sub2API. Check Magpie's selected account/key, refresh that account's catalog and use an exact upstream model ID; UI model picks do not grant key permissions")
+  error.kind = "model-account-mismatch"
+  return error
 }
 
 // ---- the site -----------------------------------------------------------------
@@ -724,14 +731,27 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}, report = ()
       throw new Error("Refusing to send Sub2API credentials outside this account's API endpoint")
     }
     const suffix = url.pathname.slice(allowed.pathname.length)
+    const gemini = /^models\/(.+):(?:generateContent|streamGenerateContent|countTokens)$/.exec(suffix)
     const protocol = /^messages(?:\/|$)/.test(suffix) ? "anthropic"
       : /^responses(?:\/|$)/.test(suffix) ? "responses"
       : suffix === "chat/completions" ? "chat-completions"
-      : /^models\/.+:(?:generateContent|streamGenerateContent|countTokens)$/.test(suffix) ? "gemini" : undefined
+      : gemini ? "gemini" : undefined
+    // Gemini names its model in the URL, not JSON's model field. Check it
+    // without reading a body or confusing it with an unrelated body.model.
+    if (gemini && state?.ids) {
+      let selected
+      try { selected = decodeURIComponent(gemini[1]) } catch { throw modelAccountMismatch(state, protocol, "path", report) }
+      if (!state.ids.has(selected)) throw modelAccountMismatch(state, protocol, "path", report)
+    }
     const target = new URL(url)
     if (protocol) target.pathname = new URL(base + routing.apiPaths[protocol].replace(/\/+$/, "") + "/").pathname + suffix
-    // A caller's Gemini query key must never select a different account.
-    if (protocol === "gemini") target.searchParams.delete("key")
+    // Credentials belong to the selected account's headers only. Sub2API
+    // rejects api_key in the query even when the header credential is valid.
+    if (protocol) {
+      for (const name of ["key", "api_key"]) {
+        if (target.searchParams.has(name)) target.searchParams.delete(name)
+      }
+    }
     report("inference.route", { protocol: protocol ?? "unknown" })
     const headers = new Headers(input instanceof Request ? input.headers : undefined)
     new Headers(init?.headers).forEach((value, name) => headers.set(name, value))
@@ -770,7 +790,7 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}, report = ()
     // bounded clone, and a Messages body gets this plugin's own 32 MiB ceiling.
     const readable = textualBody || streamedInput || (body === undefined && input instanceof Request && !input.bodyUsed)
     let bodyText
-    if ((state?.ids || inspectFast || completeClaude) && readable) {
+    if (((state?.ids && protocol !== "gemini") || inspectFast || completeClaude) && readable) {
       try {
         bodyText = await metadataBody(input, init, completeClaude ? CLAUDE_BODY_MAX : METADATA_BODY_MAX)
       } catch (error) {
@@ -794,7 +814,7 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}, report = ()
       const original = match?.[1]
       const tier = match?.[2] === "fast" ? "priority" : "ultrafast"
       if (!original || !state.ids.has(original)) {
-        throw new Error("The selected model is not listed for this Sub2API account; refresh the model catalog and select an exact upstream model ID")
+        throw modelAccountMismatch(state, protocol, "body", report)
       }
       if (!["responses", "chat-completions"].includes(protocol) || !state.tiers?.get(original)?.includes(tier)) {
         throw new Error("Legacy speed model cannot be migrated: this account has not declared the requested service tier; select the original model and verify its serviceTiers")
@@ -1437,7 +1457,6 @@ function hooks(client, id, site, options) {
   const queryFor = (auth) => querySettings({ query: settings.query }, auth?.metadata)
   const modelsFor = (auth) => validatePrices(modelSettings(settings.models, auth?.metadata))
   diagnostics(options, site)
-  const reportFor = (auth) => diagnostics(options, site, auth?.metadata)
   // Validate even overridden layers, so invalid config cannot silently drop a header.
   const headersOf = (auth) => mergedHeaders(settings.headers, auth?.metadata?.headers)
   const routingFor = (auth) => routingOf(settings.routing, auth?.metadata)
@@ -1449,6 +1468,13 @@ function hooks(client, id, site, options) {
     const bad = checkURL(base)
     if (bad) throw new Error(bad)
     return base
+  }
+  const reportFor = (auth, scope) => {
+    const report = diagnostics(options, site, auth?.metadata)
+    // Reuse the validated credential scope; diagnostics must not re-resolve
+    // configuration or log an account name, key suffix or routing URL.
+    const accountRef = scope.slice(0, 12)
+    return (event, details = {}) => report(event, { accountRef, ...details })
   }
   const prompts = site || defaultURL !== undefined
     ? []
@@ -1499,8 +1525,8 @@ function hooks(client, id, site, options) {
       const protocolHeaders = protocolHeadersFor(auth)
       queryFor(auth)
       modelsFor(auth)
-      const report = reportFor(auth)
       const scope = accountScope(base, auth.key, headers)
+      const report = reportFor(auth, scope)
       const catalogKey = fingerprint(scope, routing, modelsFor(auth))
       const state = () => {
         const authState = authStates.get(scope)
@@ -1527,7 +1553,10 @@ function hooks(client, id, site, options) {
     async usage(getAuth) {
       const auth = await getAuth()
       try {
-        return await usage(client, id, auth, baseOf(auth), headersOf(auth), query, queryFor(auth), reportFor(auth))
+        const base = baseOf(auth)
+        const headers = headersOf(auth)
+        const scope = accountScope(base, auth?.key, headers)
+        return await usage(client, id, auth, base, headers, query, queryFor(auth), reportFor(auth, scope))
       } catch (e) {
         return { error: e.message, windows: [] }
       }
@@ -1554,8 +1583,8 @@ function hooks(client, id, site, options) {
         const headers = headersOf(auth)
         const settings = queryFor(auth)
         const selection = modelsFor(auth)
-        const report = reportFor(auth)
         const scope = accountScope(base, auth.key, headers)
+        const report = reportFor(auth, scope)
         const catalogKey = fingerprint(scope, routing, selection)
         // The entry identifies the latest refresh without losing the last
         // usable IDs/tiers while a new query is pending or temporarily fails.
