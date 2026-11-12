@@ -1096,13 +1096,41 @@ async function responseBytes(res, limit, signal) {
   }
 }
 
-async function get(base, path, key, extra = {}, settings = QUERY_DEFAULTS, timeout = settings.timeoutMs) {
+// Probe only a read-only model-list endpoint. A missing native endpoint or
+// Sub2API's exact pre-inference platform rejection is evidence for chat; auth,
+// quota, transient and unparseable failures are not. Never echo the response.
+async function geminiProtocolHint(res, settings, signal) {
+  if ([404, 405, 501].includes(res.status)) {
+    void res.body?.cancel().catch(() => {})
+    return { protocol: "chat-completions", reason: "endpoint", status: res.status }
+  }
+  if (!res.ok && res.status !== 400) {
+    void res.body?.cancel().catch(() => {})
+    return { protocol: "gemini", reason: "unconfirmed", status: res.status }
+  }
+  if (!/\bjson\b/i.test(res.headers.get("content-type") ?? "")) {
+    void res.body?.cancel().catch(() => {})
+    return { protocol: "gemini", reason: "unconfirmed", status: res.status }
+  }
+  const bytes = await responseBytes(res, Math.min(settings.maxResponseBytes, 64 << 10), signal)
+  let body
+  try { body = JSON.parse(bytes.toString("utf8")) } catch {
+    return { protocol: "gemini", reason: "unconfirmed", status: res.status }
+  }
+  if (res.ok) return { protocol: "gemini", reason: Array.isArray(body?.models) ? "native" : "unconfirmed", status: res.status }
+  const refused = typeof body?.error?.message === "string"
+    && /^API key group platform is not gemini[.!]?$/i.test(body.error.message.trim())
+  return { protocol: refused ? "chat-completions" : "gemini", reason: refused ? "platform" : "unconfirmed", status: res.status }
+}
+
+async function get(base, path, key, extra = {}, settings = QUERY_DEFAULTS, timeout = settings.timeoutMs, operation) {
   const signal = AbortSignal.timeout(timeout)
   const res = await fetch(base + path, {
     headers: { accept: "application/json", ...extra, authorization: `Bearer ${key}` },
     signal,
     redirect: "error",
   })
+  if (operation === "protocol") return geminiProtocolHint(res, settings, signal)
   if (!res.ok) {
     void res.body?.cancel().catch(() => {})
     // Never echo a gateway response: it may contain reflected credentials.
@@ -1118,10 +1146,10 @@ async function get(base, path, key, extra = {}, settings = QUERY_DEFAULTS, timeo
 
 function queries(onExpired) {
   const cache = new Map()
-  return async (base, path, key, extra, settings, report, operation) => {
-    const scope = accountScope(base, key, extra)
-    const name = scope + ":" + fingerprint(path, settings)
-    const ttl = settings[`${operation}TtlMs`]
+  return async (base, path, key, extra, settings, report, operation, scopeHeaders = extra) => {
+    const scope = accountScope(base, key, scopeHeaders)
+    const name = scope + ":" + fingerprint(path, settings, operation, accountScope(base, key, extra))
+    const ttl = operation === "protocol" ? settings.modelsTtlMs : settings[`${operation}TtlMs`]
     const cached = cache.get(name)
     if (cached && (cached.pending || cached.expires > Date.now())) {
       report("query.cache", { operation, pending: cached.pending })
@@ -1129,11 +1157,11 @@ function queries(onExpired) {
     }
     const entry = { pending: true, expires: 0 }
     const started = Date.now()
-    entry.promise = get(base, path, key, extra, settings, operation === "efforts" ? settings.effortsTimeoutMs : settings.timeoutMs)
+    entry.promise = get(base, path, key, extra, settings, operation === "efforts" ? settings.effortsTimeoutMs : settings.timeoutMs, operation)
       .then((value) => {
         if (operation === "models" && !Array.isArray(value?.data)) throw queryError("Invalid model catalog", undefined, "catalog")
         entry.pending = false
-        entry.expires = Date.now() + ttl
+        entry.expires = Date.now() + (operation === "protocol" && value.reason === "unconfirmed" ? Math.min(ttl, CATALOG_ERROR_TTL) : ttl)
         report("query.complete", { operation, elapsedMs: Date.now() - started })
         return value
       }).catch((error) => {
@@ -1240,10 +1268,28 @@ async function codexModels(query, base, key, extra, settings, report) {
   return out
 }
 
+// Select the wire protocol before Magpie builds a request. Merely changing a
+// Gemini URL to /chat/completions would send the wrong JSON and response shape;
+// advertising the SDK here lets the host translate tools, streams and usage.
+async function autoGeminiProtocol(query, base, key, extra, routing, protocolExtra, settings, report) {
+  const path = routing.apiPaths.gemini.replace(/\/+$/, "") + "/models"
+  const headers = { ...protocolExtra.gemini, ...extra, "x-goog-api-key": key }
+  let hint
+  try {
+    hint = await query(base, path, key, headers, settings, report, "protocol", extra)
+  } catch {
+    // This optional metadata read cannot prove another protocol works after a
+    // timeout, redirect, oversized body or network failure. Keep the native API.
+    hint = { protocol: "gemini", reason: "unconfirmed", status: 0 }
+  }
+  report("protocol.selected", { from: "gemini", to: hint.protocol, reason: hint.reason, status: hint.status })
+  return hint.protocol
+}
+
 // models is what GET /v1/models lists for the key: its group's, in
 // Anthropic's shape or OpenAI's as the group's platform has it; was is the
 // models magpie already has.
-async function models(id, base, auth, was, extra, routing, settings, selection, query, report) {
+async function models(id, base, auth, was, extra, routing, settings, selection, query, report, protocolExtra) {
   const entries = []
   const seen = new Set()
   let totalBytes = 0
@@ -1270,16 +1316,23 @@ async function models(id, base, auth, was, extra, routing, settings, selection, 
       path = "/v1/models?after_id=" + encodeURIComponent(last)
     } else path = undefined
   }
-  const told = entries.some((m) => typeof m?.id === "string" && modelProtocol(m.id, routing) === "responses")
-    ? await codexModels(query, base, auth.key, extra, settings, report) : {}
+  const visible = entries.filter((m) => typeof m?.id === "string" && m.id
+    && (!selection.includeModels || selection.includeModels.includes(m.id)) && !selection.excludeModels.includes(m.id))
+  const automaticGemini = (model) => (routing.modelProtocols[model] ?? routing.protocol) === "auto" && modelProtocol(model, routing) === "gemini"
+  // One read-only probe per account/path, shared by every automatic Gemini model
+  // and coalesced/cached by queries. Explicit protocol choices are never probed.
+  const [geminiProtocol, told] = await Promise.all([
+    visible.some((m) => automaticGemini(m.id))
+      ? autoGeminiProtocol(query, base, auth.key, extra, routing, protocolExtra, settings, report) : "gemini",
+    entries.some((m) => typeof m?.id === "string" && modelProtocol(m.id, routing) === "responses")
+      ? codexModels(query, base, auth.key, extra, settings, report) : {},
+  ])
   const out = Object.create(null)
-  for (const m of entries) {
-    if (typeof m?.id !== "string" || !m.id) continue
-    if ((selection.includeModels && !selection.includeModels.includes(m.id)) || selection.excludeModels.includes(m.id)) continue
+  for (const m of visible) {
     const display = selection.modelNames[m.id] ?? m.display_name ?? m.name
     const named = typeof display === "string" && !!display
     const name = named ? display : m.id
-    const protocol = modelProtocol(m.id, routing)
+    const protocol = automaticGemini(m.id) ? geminiProtocol : modelProtocol(m.id, routing)
     out[m.id] = runtimeModel({ id: m.id, name, named, reasoning: m.reasoning === true || m.capabilities?.reasoning === true }, base + routing.apiPaths[protocol].replace(/\/+$/, ""), id, reasoningLevels(m) ?? told[m.id]?.levels, was?.[m.id], PROTOCOLS[protocol], selection.modelOverrides[m.id])
     out[m.id].name = modelDisplayName(selection.modelNames[m.id] ?? out[m.id].name, m.id)
     out[m.id].serviceTiers = modelServiceTiers(m, told[m.id], selection, protocol)
@@ -1594,7 +1647,7 @@ function hooks(client, id, site, options) {
         // Cosmetic discovery must not hold up the account's model catalog.
         void refreshIcon(base, true).catch(() => report("icon.failed"))
         try {
-          const found = await models(id, base, auth, provider?.models, headers, routing, settings, selection, query, report)
+          const found = await models(id, base, auth, provider?.models, headers, routing, settings, selection, query, report, protocolHeadersFor(auth))
           const currentAuth = authStates.get(scope)
           if (currentAuth?.error && currentAuth.error !== authAtStart?.error) throw currentAuth.error
           if (currentAuth && currentAuth !== authAtStart && catalogs.get(catalogKey) !== catalog) {

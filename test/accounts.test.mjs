@@ -31,6 +31,7 @@ function mockAccounts(t) {
       return Response.json({ data: group.ids.map((id) => ({ id })) })
     }
     if (url.pathname.endsWith("/backend-api/codex/models")) return Response.json({ models: [] })
+    if (url.pathname.endsWith("/v1beta/models")) return Response.json({ models: group.ids.map((id) => ({ name: "models/" + id })) })
     sent.push({ url: url.href, headers, body: init?.body, input })
     return Response.json({ ok: true })
   })
@@ -267,6 +268,10 @@ test("real HTTP same-address multi-key requests reach the matching native endpoi
       return
     }
     if (url.pathname.endsWith("/backend-api/codex/models")) { res.end('{"models":[]}'); return }
+    if (url.pathname === "/gateway/v1beta/models") {
+      res.end(JSON.stringify({ models: group.ids.map((id) => ({ name: "models/" + id })) }))
+      return
+    }
     let body = ""
     for await (const chunk of req) body += chunk
     calls.push({ url: req.url, headers: req.headers, body, group })

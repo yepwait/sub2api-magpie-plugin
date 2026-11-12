@@ -12,6 +12,7 @@
 - **余额**：余额计费的 key 显示钱包余额，包括零余额。
 - **模型列表**：自动读取 `GET /v1/models` 的思考等级和快速档位；含 Responses 模型时自动通过同一 key 的 `GET /backend-api/codex/models` 补充缺失信息，无需开启额外选项。辅助接口不可用时保留已知思考等级或使用默认值，不猜测快速权限。
 - **账号绑定**：完整列出每个 API key 返回的模型，支持分页；发送使用所选账号自己的 Base URL、API key 和请求头，不在插件内切换 key 或模型。
+- **Gemini 自动协议选择**：自动模式在获取模型时只读探测原生目录；明确不支持原生入口时改用 OpenAI Chat Completions，由 Magpie 完成协议转换，不重发生成请求。
 - **原模型速度选择**：读取当前 key 报告的 Fast / Ultraspeed 能力，以 `serviceTiers` 交给 Magpie；兼容 omp、pi、Claude Code 等客户端已发送的原生速度参数，Anthropic fast 自动补齐兼容 beta 头，不额外生成模型或默认开启加速。
 - **请求指标**：保留四种协议的用量、缓存和流式事件，由 Magpie 原生统计耗时、首响应、token、缓存命中率、输出速度和估算费用，不重复上报账单。
 - **请求头**：支持全局、站点和账号级配置，查询及实际模型发送均生效，大小写不敏感地合并。
@@ -27,7 +28,7 @@
 | DeepSeek、Kimi、GLM、Qwen、MiniMax 等国产模型，以及 Grok、其他兼容模型 | `chat-completions`（别名 `openai-compatible`） | `/v1/chat/completions` |
 | Google Gemini 原生 | `gemini`（别名 `google`） | `/v1beta/models/{模型}:generateContent` 或 `:streamGenerateContent` |
 
-默认 `auto`：按模型名称识别 Claude、GPT、Gemini，包括 `anthropic/`、`openai/`、`google/` 等带前缀名称，其余走 Chat Completions。自定义别名不一定能自动判断，使用下文的显式配置覆盖。插件保留响应流、状态码和取消信号，不缓冲模型响应。
+默认 `auto`：按模型名称识别 Claude、GPT、Gemini，包括 `anthropic/`、`openai/`、`google/` 等带前缀名称，其余走 Chat Completions。自动识别的 Gemini 还会执行下文的只读协议探测；原生入口明确不可用时选择 Chat Completions。自定义别名不一定能自动判断，使用下文的显式配置覆盖。插件保留响应流、状态码和取消信号，不缓冲模型响应。
 
 ## 本地安装
 
@@ -215,6 +216,17 @@ Codex 元数据检查支持字符串、字节、Blob 和 `Request` 副本，最�
 - 若国产模型分组要求 Anthropic 格式，可设为 `anthropic`，不要求模型名称以 Claude 开头。
 - 账号协议选项保存在 `metadata.protocol` 中；高级的账号级规则也可通过 `metadata.modelProtocols`、`metadata.apiPaths` 配置。修改后需要 Magpie 重载账号及模型列表。
 
+### Gemini 原生入口不可用时自动选择 OpenAI 兼容协议
+
+无需手写每个 Gemini 的映射。`protocol: "auto"`（默认）且模型名称识别为 Gemini 时，插件在**获取模型目录阶段**使用该账号自己的 key 只读查询 `GET /v1beta/models`，自定义路径则查询 `{apiPaths.gemini}/models`；同一账号的多个 Gemini 模型共用一次查询，不发送 prompt 或生成请求。
+
+- 原生目录返回 HTTP 400 且 JSON `error.message` 精确为 `API key group platform is not gemini`，或返回 404 / 405 / 501 时，将这些自动 Gemini 模型的 SDK 改为 `@ai-sdk/openai-compatible`、地址改为配置的 Chat Completions 基址。后续“测试模型”和真实请求直接使用 `/v1/chat/completions`，**模型 ID 和 key 不变**。这是尝试备用协议，不代表仅凭目录已验证兼容入口能成功推理。
+- 原生目录可用时保留 `@ai-sdk/google`。其他 400、401/403、429、5xx（501 除外）、超时、网络失败、重定向及无效/过大正文都不能证明应换协议：保留原生，不因临时故障误切。可选原生目录的 401 不单独标记整个账号失效；主目录、用量及真实请求仍按既有鉴权规则处理。
+- 显式 `protocol: "gemini"`、`protocol: "chat-completions"` 或该模型的非 `auto` `modelProtocols` 始终优先，不探测、不覆盖。要恢复自动选择，删除对应显式规则或设为 `auto`；GPT、Claude 和其他模型不会被本功能改协议。Antigravity 专用入口仍可通过 `apiPaths.gemini` 指定，不自动强制切换站点平台。
+- 探测按地址、key、最终请求头、协议路径和查询设置隔离，进程内合并并发查询，跟随 `modelsTtlMs` 缓存（默认 60 秒）；不确定的 HTTP/JSON 结果最多保留 30 秒，异常不作为已确认协议缓存。使用 `query.timeoutMs` 超时，正文最多 `min(maxResponseBytes, 64 KiB)`；所有探测禁止重定向，不记录响应正文或凭据。`protocolHeaders.gemini` 在该探测中生效，全局/站点/账号头优先。
+- 插件先把正确 SDK 交给 Magpie，再由宿主进行请求体、工具、响应流和用量转换，**不是把 Gemini JSON 直接改 URL 发到 OpenAI**。生成请求仍只发一次；兼容入口也失败时返回原始错误，不再换 key、换模型、切 Responses 或 Anthropic 盲试。已经开始的请求、旧客户端缓存的原生目录不在发送中改协议；更新后请重载插件、重新获取模型并同步客户端目录，必要时新开会话。
+- `diagnostics: true` 新增 `protocol.selected` 事件，包含 `from`、`to`、固定 `reason` 和元数据 HTTP 状态，并沿用 `accountRef`；日志的备用选择可以核对，不把上游自由文本写入日志。同一池中同名模型在不同 key 上需要不同 SDK 时，Magpie 可能合并模型级协议，建议用独立站点 provider 隔离；本功能不重写宿主调度。
+
 ### 自定义协议路径
 
 站点默认采用上述标准路径；自定义部署或 Antigravity 专用入口可配置 `apiPaths`。值是相对于站点根地址的路径，不是完整接口 URL，也不含最后的 `messages`、`responses` 等操作名。例如：
@@ -270,7 +282,7 @@ Magpie 的账号级 `baseURL` 优先于模型地址，因此发送函数还会�
   "sites": [
     {"id":"my-gpt","name":"GPT key","url":"https://api.example.com","protocol":"responses"},
     {"id":"my-claude","name":"Claude key","url":"https://api.example.com","protocol":"anthropic"},
-    {"id":"my-gemini","name":"Gemini key","url":"https://api.example.com","protocol":"gemini"}
+    {"id":"my-gemini","name":"Gemini key","url":"https://api.example.com","protocol":"auto"}
   ]
 }
 ```
@@ -387,7 +399,8 @@ Magpie 选择账号后，上游收到的 `model` 是 `gpt-example`，速度参�
 - TTL 为毫秒，设为 `0` 禁用完成结果缓存，但仍合并正在进行的相同查询；TTL 最大 1 小时。缓存是有效期内的成功结果复用，不是失败后的旧数据回退。缓存最多 128 项，超出逐出较早条目。
 - 普通查询超时和思考等级查询超时分别可设为 1–60000 毫秒；JSON 大小可设为 1 字节到 64 MiB，默认 4 MiB，并检查声明长度和实际读取长度。
 - 只有含 Responses 模型的列表才查询 Codex manifest，默认最多额外等 15 秒，避免较慢站点的能力查询被误降级为三个默认等级且不显示 Fast；非 401 失败后 30 秒内不重复探测，保留已知思考等级。图标发现和模型发现互不阻塞。
-- 当前模型刷新或用量查询观察到的 401 会标记需要登录，不影响其他 key；独立用量查询后到的 401 仍生效，不会被先完成的模型刷新忽略。每次普通目录错误阻断推理 30 秒，缓存命中不会延长该期限；被较新模型刷新替代的旧结果不能重建过时错误。401 会清除该凭据作用域的查询缓存，其他失败不作为成功缓存，没有管理查询或计费请求的自动重试。
+- 当前主模型目录/辅助 manifest 刷新或用量查询观察到的 401 会标记需要登录，不影响其他 key；独立用量查询后到的 401 仍生效，不会被先完成的模型刷新忽略。每次普通目录错误阻断推理 30 秒，缓存命中不会延长该期限；被较新模型刷新替代的旧结果不能重建过时错误。401 会清除该凭据作用域的查询缓存，其他失败不作为成功缓存，没有管理查询或计费请求的自动重试。
+- 自动 Gemini 的原生目录探测使用同一查询超时和缓存约束，`protocol.selected` 记录原生/兼容协议选择；不确定的可选结果不冒充已经验证的协议能力，不影响主目录的真实性。
 - 开启 `diagnostics: true` 可查看固定事件名、协议、耗时、数量、缓存命中和 HTTP 状态，并通过凭据作用域的摘要 `accountRef` 关联目录与发送。`inference.model_rejected` 表示本地模型/账号不匹配，含模型来源和目录数量，不代表上游返回 HTTP 错误。日志不包含账号名、模型名、站点 URL、请求体、响应体或请求头值。管理接口错误不回显站点返回的内容，避免反射密钥。
 
 ## 请求指标
