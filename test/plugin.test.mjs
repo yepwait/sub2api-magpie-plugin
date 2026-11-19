@@ -35,18 +35,19 @@ function mockAPI(t, usage = { balance: 12.34 }) {
   return calls
 }
 
-test("GPT generations use fallback efforts despite stale non-reasoning host metadata", async (t) => {
-  const ids = ["gpt-6-astra", "gpt-6.1-sol", "vendor/gpt-6-luna", "gpt-10-sol", "gpt-4.1", "other-test"]
-  t.mock.method(globalThis, "fetch", async (input) => new URL(input).pathname.endsWith("/models") && !String(input).includes("backend-api")
-    ? json({ data: ids.map((id) => ({ id })) }) : json({}, 404))
+test("GPTs without concrete efforts leave the host free to look up levels by model ID", async (t) => {
+  const ids = ["gpt-6-astra", "gpt-6.2-astra", "vendor/gpt-6-luna", "gpt-10-sol", "gpt-4.1", "other-test"]
+  t.mock.method(globalThis, "fetch", async (input) => String(input).includes("backend-api")
+    ? json({ models: [{ slug: "gpt-6.2-astra", supported_reasoning_levels: [{ effort: "none" }] }] })
+    : json({ data: ids.map((id) => ({ id })) }))
   const plugin = await plugins.Sub2apiPlugin()
   const previous = Object.fromEntries(ids.map((id) => [id, { capabilities: { reasoning: false }, variants: {} }]))
   const models = await plugin.provider.models({ models: previous }, { auth: auth() })
   for (const id of ids) {
     const thinks = !["gpt-4.1", "other-test"].includes(id)
     assert.equal(models[id].capabilities.reasoning, thinks, id)
-    assert.deepEqual(Object.keys(models[id].variants), thinks ? ["low", "medium", "high"] : [], id)
-    assert.deepEqual(models[id].serviceTiers, [], id)
+    assert.deepEqual(models[id].variants, {}, id)
+    assert.deepEqual(models[id].serviceTiers, id === "other-test" ? [] : ["priority", "ultrafast"], id)
   }
 })
 
@@ -85,16 +86,16 @@ test("model discovery automatically supplements efforts and speed from the same 
     if (init?.credentials === "omit") return new Response(null, { status: 404 })
     calls.push(new Headers(init?.headers).get("authorization"))
     if (String(input).includes("backend-api")) return json({ models: [
-      { slug: "gpt-6-sol", supported_reasoning_levels: ["low", "high", "xhigh"], service_tiers: [{ id: "priority" }, "ultrafast"] },
-      { slug: "gpt-6-luna", service_tiers: ["priority"] },
+      { slug: "gpt-6-sol", supported_reasoning_levels: ["low", "high", "xhigh"], service_tiers: [{ id: "priority" }, "flex"] },
+      { slug: "gpt-6-luna", service_tiers: ["flex"] },
     ] })
     return json({ data: [{ id: "gpt-6-sol" }, { id: "gpt-6-luna", service_tiers: [] }] })
   })
   const plugin = await plugins.Sub2apiPlugin()
   const models = await plugin.provider.models({ models: {} }, { auth: auth({}, "key-a") })
   assert.deepEqual(Object.keys(models["gpt-6-sol"].variants), ["low", "high", "xhigh"])
-  assert.deepEqual(models["gpt-6-sol"].serviceTiers, ["priority", "ultrafast"])
-  assert.deepEqual(models["gpt-6-luna"].serviceTiers, [])
+  assert.deepEqual(models["gpt-6-sol"].serviceTiers, ["priority", "flex", "ultrafast"])
+  assert.deepEqual(models["gpt-6-luna"].serviceTiers, ["priority", "ultrafast"])
   assert.deepEqual(calls, ["Bearer key-a", "Bearer key-a"])
 })
 
@@ -114,10 +115,10 @@ test("all model families and aliases read reported efforts and protocol-appropri
   })
   const plugin = await plugins.Sub2apiPlugin()
   const models = await plugin.provider.models({ models: {} }, { auth: auth() })
-  const expected = [["low", "max"], ["minimal", "high"], ["high"], ["medium"], ["low", "medium", "high"], ["low", "medium", "high"], []]
+  const expected = [["low", "max"], ["minimal", "high"], ["high"], ["medium"], [], [], []]
   for (const [i, entry] of entries.entries()) {
     assert.deepEqual(Object.keys(models[entry.id].variants), expected[i], entry.id)
-    assert.equal(models[entry.id].capabilities.reasoning, expected[i].length > 0, entry.id)
+    assert.equal(models[entry.id].capabilities.reasoning, expected[i].length > 0 || entry.reasoning === true || entry.capabilities?.reasoning === true, entry.id)
     assert.deepEqual(models[entry.id].serviceTiers, i < 2 ? [] : entry.service_tiers ?? [], entry.id)
   }
   const compatible = await plugins.Sub2apiPlugin({}, { modelProtocols: { "claude-custom": "chat-completions", "gemini-custom": "chat-completions" } })

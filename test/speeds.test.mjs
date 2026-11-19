@@ -50,21 +50,31 @@ test("reported speeds stay on original models without adding model IDs or changi
   assert.deepEqual(output.headers, {})
 })
 
-test("missing capabilities never infer speeds from model names, protocols or another account's host metadata", async (t) => {
-  mockAPI(t, { entries: ["gpt-test", "gpt-5-test", "o3-test", "chat-model"] })
-  const plugin = await Sub2apiPlugin()
-  const found = await plugin.provider.models({ models: { "gpt-test": { serviceTiers: ["priority", "ultrafast"], fast: true } } }, { auth: account() })
-  assert.deepEqual(Object.keys(found), ["gpt-test", "gpt-5-test", "o3-test", "chat-model"])
-  for (const model of Object.values(found)) {
-    assert.deepEqual(model.serviceTiers, [])
+test("only listed GPT wire IDs get manual speeds, regardless of display names or stale host metadata", async (t) => {
+  const eligible = ["gpt-6.2-astra", "vendor/openai/GpT-example", "vendor/ChatGPT-preview"]
+  const other = ["gpt-namespace/alias", "vendor/not-gpt-6.2-astra", "gpt", "o3-test", "codex-test", "chat-model"]
+  const { requests } = mockAPI(t, { entries: [...eligible, ...other] })
+  const plugin = await Sub2apiPlugin({}, { modelProtocols: { "vendor/ChatGPT-preview": "chat-completions", "gpt-namespace/alias": "responses" } })
+  const found = await plugin.provider.models({ models: {
+    "gpt-6.2-astra": { name: "Private alias", serviceTiers: ["flex"], fast: true },
+    "chat-model": { name: "gpt-name-only", api: { id: "gpt-wrong-wire-id" }, serviceTiers: ["priority"], fast: true },
+    "gpt-host-only": { serviceTiers: ["flex"] },
+  } }, { auth: account() })
+  assert.deepEqual(Object.keys(found), [...eligible, ...other])
+  for (const [id, model] of Object.entries(found)) {
+    assert.deepEqual(model.serviceTiers, eligible.includes(id) ? ["priority", "ultrafast"] : [], id)
+    assert.equal(model.api.id, id)
+    assert.equal(model.options.serviceTier, undefined, id)
+    assert.equal(model.options.service_tier, undefined, id)
     assert.equal(model.fast, undefined)
   }
+  assert.equal(requests.length, 0)
 })
 
 test("display names strip trailing speed labels without changing IDs or inferring tier support", async (t) => {
   const entries = [
     { id: "gpt-fast-label", display_name: "GPT Example (fast)", service_tiers: ["priority", "ultrafast"] },
-    { id: "gpt-wide-label", name: "GPT Example \uFF08 FaSt \uFF09" },
+    { id: "chat-wide-label", name: "GPT Example \uFF08 FaSt \uFF09" },
     { id: "gpt-ultra-label", display_name: "GPT Example (ULTRASPEED)" },
     { id: "gpt-stacked-label", display_name: "GPT Example (fast) \uFF08ultrafast\uFF09  " },
     { id: "gpt-interior", display_name: "GPT (fast) Example (preview)" },
@@ -77,14 +87,14 @@ test("display names strip trailing speed labels without changing IDs or inferrin
   const plugin = await Sub2apiPlugin()
   const found = await plugin.provider.models(provider, { auth: account() })
   assert.deepEqual(Object.keys(found), entries.map((m) => m.id))
-  for (const id of ["gpt-fast-label", "gpt-wide-label", "gpt-ultra-label", "gpt-stacked-label"]) {
+  for (const id of ["gpt-fast-label", "chat-wide-label", "gpt-ultra-label", "gpt-stacked-label"]) {
     assert.equal(found[id].name, "GPT Example")
   }
   assert.equal(found["gpt-interior"].name, "GPT (fast) Example (preview)")
   for (const id of ["gpt-label-only", "gpt-real-fast", "gpt-real (fast)"]) assert.equal(found[id].name, id)
   for (const model of Object.values(found)) {
     assert.equal(model.api.id, model.id)
-    assert.deepEqual(model.serviceTiers, model.id === "gpt-fast-label" ? ["priority", "ultrafast"] : [])
+    assert.deepEqual(model.serviceTiers, model.id === "chat-wide-label" ? [] : ["priority", "ultrafast"], model.id)
   }
   assert.deepEqual(entries, original)
 })
@@ -117,33 +127,40 @@ test("the same key's Codex manifest supplies tiers independently of reasoning le
   mockAPI(t, {
     entries: ["gpt-test", "gpt-other", "gpt-none"],
     manifest: { models: [
-      { slug: "gpt-test", service_tiers: [{ id: "priority" }, { id: "ultrafast" }] },
+      { slug: "gpt-test", service_tiers: ["flex", { id: "priority" }, { id: "ultrafast" }] },
       { slug: "gpt-other", supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }], service_tiers: ["priority"] },
       { slug: "gpt-none", supported_reasoning_levels: ["none"], service_tiers: ["ultrafast"] },
-      { slug: "not-listed", service_tiers: ["priority"] },
+      { slug: "gpt-not-listed", service_tiers: ["priority"] },
     ] },
   })
   const plugin = await Sub2apiPlugin()
   const found = await plugin.provider.models(provider, { auth: account() })
   assert.deepEqual(Object.keys(found), ["gpt-test", "gpt-other", "gpt-none"])
-  assert.deepEqual(found["gpt-test"].serviceTiers, ["priority", "ultrafast"])
+  assert.deepEqual(found["gpt-test"].serviceTiers, ["flex", "priority", "ultrafast"])
   assert.deepEqual(Object.keys(found["gpt-other"].variants), ["low", "high"])
-  assert.deepEqual(found["gpt-none"].serviceTiers, ["ultrafast"])
+  assert.deepEqual(found["gpt-other"].serviceTiers, ["priority", "ultrafast"])
+  assert.deepEqual(found["gpt-none"].serviceTiers, ["ultrafast", "priority"])
   assert.equal(found["gpt-none"].capabilities.reasoning, false)
 })
 
-test("explicit model-list tiers including empty, null or malformed values take precedence over optional manifests", async (t) => {
-  mockAPI(t, {
-    entries: [
-      { id: "gpt-empty", service_tiers: [] }, { id: "gpt-null", service_tiers: null },
-      { id: "gpt-malformed", service_tiers: "priority" }, { id: "gpt-fast-only", service_tiers: ["priority"] },
-    ],
-    manifest: { models: ["gpt-empty", "gpt-null", "gpt-malformed", "gpt-fast-only"].map((slug) => ({ slug, service_tiers: ["ultrafast"] })) },
-  })
+test("primary tiers take precedence over the manifest, then missing GPT choices are appended in order", async (t) => {
+  const entries = [
+    { id: "gpt-empty", service_tiers: [] }, { id: "gpt-null", service_tiers: null },
+    { id: "gpt-malformed", service_tiers: "priority" }, { id: "gpt-invalid", service_tiers: [null, {}, "bad tier"] },
+    { id: "gpt-fast-only", service_tiers: ["priority"] }, { id: "chatgpt-partial", serviceTiers: ["FLEX", { id: "ultraspeed" }, "flex"] },
+    { id: "gpt-other-tiers", service_tiers: ["flex", "default", "flex"] },
+    { id: "chat-empty", service_tiers: [] }, { id: "chat-fast-only", service_tiers: ["priority"] },
+  ]
+  mockAPI(t, { entries, manifest: { models: entries.map(({ id }) => ({ slug: id, service_tiers: ["manifest-only"] })) } })
   const plugin = await Sub2apiPlugin()
   const found = await plugin.provider.models(provider, { auth: account() })
-  for (const id of ["gpt-empty", "gpt-null", "gpt-malformed"]) assert.deepEqual(found[id].serviceTiers, [])
-  assert.deepEqual(found["gpt-fast-only"].serviceTiers, ["priority"])
+  for (const id of ["gpt-empty", "gpt-null", "gpt-malformed", "gpt-invalid", "gpt-fast-only"]) {
+    assert.deepEqual(found[id].serviceTiers, ["priority", "ultrafast"], id)
+  }
+  assert.deepEqual(found["chatgpt-partial"].serviceTiers, ["flex", "ultrafast", "priority"])
+  assert.deepEqual(found["gpt-other-tiers"].serviceTiers, ["flex", "default", "priority", "ultrafast"])
+  assert.deepEqual(found["chat-empty"].serviceTiers, [])
+  assert.deepEqual(found["chat-fast-only"].serviceTiers, ["priority"])
 })
 
 test("tier metadata normalizes aliases and objects, deduplicates IDs and ignores invalid untrusted values", async (t) => {
@@ -154,43 +171,53 @@ test("tier metadata normalizes aliases and objects, deduplicates IDs and ignores
 })
 
 test("explicit per-model tier declarations merge global < site < account without changing identity", async (t) => {
-  mockAPI(t, { entries: ["gpt-test", "chat-model", "gpt-other"] })
+  mockAPI(t, { entries: [{ id: "gpt-test", service_tiers: ["flex"] }, { id: "gpt-disabled", service_tiers: ["priority"] }, "gpt-other"] })
   const plugin = await Sub2apiSite1({}, {
-    modelOverrides: { "gpt-test": { serviceTiers: ["priority"], limit: { context: 128000 } }, "chat-model": { serviceTiers: ["fast"] } },
-    sites: [{ id: "speed-site", url: BASE, modelOverrides: { "gpt-test": { serviceTiers: ["ultrafast"] } } }],
+    modelOverrides: { "gpt-test": { serviceTiers: ["priority"], limit: { context: 128000 } }, "gpt-disabled": { serviceTiers: ["fast"] } },
+    speedModels: { "gpt-test": ["fast"], "gpt-disabled": ["ultraspeed"] },
+    sites: [{ id: "speed-site", url: BASE, modelOverrides: { "gpt-test": { serviceTiers: ["flex"] } } }],
   })
-  const auth = account("key", BASE, { modelOverrides: { "gpt-test": { serviceTiers: ["fast", "ultraspeed"] }, "chat-model": { serviceTiers: [] } } })
+  const auth = account("key", BASE, { modelOverrides: { "gpt-test": { serviceTiers: ["ultraspeed"] }, "gpt-disabled": { serviceTiers: [] } } })
   const found = await plugin.provider.models(provider, { auth })
-  assert.deepEqual(Object.keys(found), ["gpt-test", "chat-model", "gpt-other"])
-  assert.deepEqual(found["gpt-test"].serviceTiers, ["priority", "ultrafast"])
-  assert.deepEqual(found["chat-model"].serviceTiers, [])
-  assert.deepEqual(found["gpt-other"].serviceTiers, [])
+  assert.deepEqual(Object.keys(found), ["gpt-test", "gpt-disabled", "gpt-other"])
+  assert.deepEqual(found["gpt-test"].serviceTiers, ["ultrafast"])
+  assert.deepEqual(found["gpt-disabled"].serviceTiers, [])
+  assert.deepEqual(found["gpt-other"].serviceTiers, ["priority", "ultrafast"])
   assert.equal(found["gpt-test"].limit.context, 128000)
   assert.equal(found["gpt-test"].providerID, "speed-site")
   assert.equal(found["gpt-test"].api.id, "gpt-test")
 })
 
-test("legacy speedModels arrays only filter reported support and never manufacture capabilities or aliases", async (t) => {
-  mockAPI(t, { entries: [{ id: "gpt-test", service_tiers: ["priority", "ultrafast", "flex"] }, "gpt-unknown"] })
-  for (const [speedModels, tiers] of [
-    [["fast", "ultraspeed"], ["priority", "ultrafast", "flex"]], [["fast"], ["priority", "flex"]], [[], ["flex"]],
+test("legacy speedModels arrays filter reported tiers and GPT choices without granting migration support", async (t) => {
+  const { requests } = mockAPI(t, { entries: [{ id: "gpt-test", service_tiers: ["priority", "ultrafast", "flex"] }, "gpt-unknown", "chat-unknown"] })
+  for (const [speedModels, reported, choices] of [
+    [["fast", "ultraspeed"], ["priority", "ultrafast", "flex"], ["priority", "ultrafast"]],
+    [["fast"], ["priority", "flex"], ["priority"]], [[], ["flex"], []],
   ]) {
     const plugin = await Sub2apiPlugin({}, { speedModels })
     const found = await plugin.provider.models(provider, { auth: account() })
-    assert.deepEqual(Object.keys(found), ["gpt-test", "gpt-unknown"])
-    assert.deepEqual(found["gpt-test"].serviceTiers, tiers)
-    assert.deepEqual(found["gpt-unknown"].serviceTiers, [])
+    assert.deepEqual(Object.keys(found), ["gpt-test", "gpt-unknown", "chat-unknown"])
+    assert.deepEqual(found["gpt-test"].serviceTiers, reported)
+    assert.deepEqual(found["gpt-unknown"].serviceTiers, choices)
+    assert.deepEqual(found["chat-unknown"].serviceTiers, [])
+    const loader = await plugin.auth.loader(async () => account())
+    await assert.rejects(loader.fetch(BASE + "/v1/responses", { body: '{"model":"gpt-unknown-fast"}' }), /has not declared/)
+    if (!speedModels.includes("ultraspeed")) {
+      await assert.rejects(loader.fetch(BASE + "/v1/responses", { body: '{"model":"gpt-test-ultraspeed"}' }), /has not declared/)
+    }
   }
+  assert.equal(requests.length, 0)
 })
 
-test("legacy per-model speed declarations work on original models without generating aliases", async (t) => {
-  mockAPI(t, { entries: ["gpt-test", "chat-model"] })
+test("legacy per-model speed declarations replace reported tiers and GPT choices without generating aliases", async (t) => {
+  mockAPI(t, { entries: ["gpt-test", { id: "gpt-disabled", service_tiers: ["priority"] }, "chat-model"] })
   const plugin = await Sub2apiSite1({}, {
-    speedModels: { "gpt-test": ["fast"] }, sites: [{ id: "legacy", url: BASE, speedModels: { "chat-model": ["ultraspeed"] } }],
+    speedModels: { "gpt-test": ["fast"], "gpt-disabled": [] }, sites: [{ id: "legacy", url: BASE, speedModels: { "chat-model": ["ultraspeed"] } }],
   })
-  const found = await plugin.provider.models(provider, { auth: account("key", BASE, { speedModels: { "gpt-test": ["fast", "ultraspeed"] } }) })
-  assert.deepEqual(Object.keys(found), ["gpt-test", "chat-model"])
-  assert.deepEqual(found["gpt-test"].serviceTiers, ["priority", "ultrafast"])
+  const found = await plugin.provider.models(provider, { auth: account("key", BASE, { speedModels: { "gpt-test": ["ultraspeed"] } }) })
+  assert.deepEqual(Object.keys(found), ["gpt-test", "gpt-disabled", "chat-model"])
+  assert.deepEqual(found["gpt-test"].serviceTiers, ["ultrafast"])
+  assert.deepEqual(found["gpt-disabled"].serviceTiers, [])
   assert.deepEqual(found["chat-model"].serviceTiers, ["ultrafast"])
 })
 
@@ -205,7 +232,7 @@ test("original models retain metadata, prices and real upstream IDs that happen 
   assert.deepEqual(found["gpt-test"].variants, { high: {} })
   assert.equal(found["gpt-test"].headers["x-model"], "retained")
   for (const model of Object.values(found)) assert.equal(model.id, model.api.id)
-  assert.deepEqual(found["gpt-test-fast"].serviceTiers, [])
+  for (const id of ["gpt-test-fast", "gpt-test-ultraspeed"]) assert.deepEqual(found[id].serviceTiers, ["priority", "ultrafast"])
 })
 
 test("tier declarations respect filters and cannot add unlisted models", async (t) => {
@@ -226,28 +253,30 @@ test("invalid tier declarations fail without exposing configuration values", asy
   for (const speedModels of [null, "fast", ["priority"], { a: "fast" }]) await assert.rejects(Sub2apiPlugin({}, { speedModels }), /speed/i)
 })
 
-test("unsupported protocols do not advertise OpenAI tiers or silently accept explicit tier overrides", async (t) => {
-  mockAPI(t, { entries: [{ id: "claude-test", service_tiers: ["priority"] }, { id: "gemini-test", service_tiers: ["ultrafast"] }] })
-  const plugin = await Sub2apiPlugin()
+test("native Anthropic and Gemini do not advertise OpenAI tiers even for GPT IDs or accept explicit tier overrides", async (t) => {
+  const nativeIds = ["claude-test", "gemini-test", "ns/gpt-on-messages", "chatgpt-on-gemini"]
+  const modelProtocols = { "ns/gpt-on-messages": "anthropic", "chatgpt-on-gemini": "gemini" }
+  mockAPI(t, { entries: nativeIds.map((id) => ({ id, service_tiers: ["priority"] })) })
+  const plugin = await Sub2apiPlugin({}, { modelProtocols })
   const found = await plugin.provider.models(provider, { auth: account() })
-  assert.deepEqual(found["claude-test"].serviceTiers, [])
-  assert.deepEqual(found["gemini-test"].serviceTiers, [])
-  for (const model of ["claude-test", "gemini-test"]) {
-    const explicit = await Sub2apiPlugin({}, { modelOverrides: { [model]: { serviceTiers: ["priority"] } } })
+  for (const id of nativeIds) {
+    assert.deepEqual(found[id].serviceTiers, [], id)
+    const explicit = await Sub2apiPlugin({}, { modelProtocols, modelOverrides: { [id]: { serviceTiers: ["priority"] } } })
     await assert.rejects(explicit.provider.models(provider, { auth: account() }), /protocol/)
   }
 })
 
 test("Agent-selected speeds preserve the exact original request, key, response and cancellation", async (t) => {
   const response = new Response('data: {"usage":{"input_tokens":4,"output_tokens":2}}\n\n', { headers: { "content-type": "text/event-stream" } })
-  const { requests } = mockAPI(t, { entries: ["gpt-test", "chat-model", "claude-test"], reply: () => response })
-  const plugin = await Sub2apiPlugin()
-  await plugin.provider.models(provider, { auth: account() })
+  const { requests } = mockAPI(t, { entries: ["gpt-6.2-astra", "vendor/ChatGPT-preview", "claude-test"], reply: () => response })
+  const plugin = await Sub2apiPlugin({}, { modelProtocols: { "vendor/ChatGPT-preview": "chat-completions" } })
+  const found = await plugin.provider.models(provider, { auth: account() })
+  for (const id of ["gpt-6.2-astra", "vendor/ChatGPT-preview"]) assert.deepEqual(found[id].serviceTiers, ["priority", "ultrafast"])
   const loader = await plugin.auth.loader(async () => account())
   const controller = new AbortController()
   for (const path of ["responses", "chat/completions", "messages"]) {
     for (const tier of [undefined, "priority", "ultrafast"]) {
-      const model = path === "messages" ? "claude-test" : path === "responses" ? "gpt-test" : "chat-model"
+      const model = path === "messages" ? "claude-test" : path === "responses" ? "gpt-6.2-astra" : "vendor/ChatGPT-preview"
       const body = JSON.stringify({ model, stream: true, ...(path === "messages" ? { speed: "fast" } : tier ? { service_tier: tier } : {}) })
       assert.equal(await loader.fetch(BASE + "/v1/" + path, { method: "POST", body, signal: controller.signal, headers: { authorization: "Bearer wrong", ...(path === "messages" ? { "user-agent": "claude-cli/2.1.296 (external, cli)" } : {}) } }), response)
       assert.equal(requests.at(-1).init.body, body)
@@ -409,6 +438,25 @@ test("legacy speed IDs normalize to a listed original and supported tier before 
   assert.equal(requests.length, 3)
 })
 
+test("explicit per-model declarations authorize only their own legacy speed migrations", async (t) => {
+  const { requests } = mockAPI(t, { entries: ["gpt-custom", "vendor/ChatGPT-custom"] })
+  const plugin = await Sub2apiPlugin({}, {
+    modelOverrides: { "gpt-custom": { serviceTiers: ["priority"] } },
+    speedModels: { "vendor/ChatGPT-custom": ["ultraspeed"] },
+  })
+  await plugin.provider.models(provider, { auth: account() })
+  const loader = await plugin.auth.loader(async () => account())
+  for (const [id, suffix, tier, undeclared] of [
+    ["gpt-custom", "fast", "priority", "ultrafast"], ["vendor/ChatGPT-custom", "ultraspeed", "ultrafast", "fast"],
+  ]) {
+    const send = (suffix) => loader.fetch(BASE + "/v1/responses", { method: "POST", body: JSON.stringify({ model: id + "-" + suffix }) })
+    await send(suffix)
+    assert.deepEqual(JSON.parse(requests.at(-1).init.body), { model: id, service_tier: tier })
+    await assert.rejects(send(undeclared), /has not declared/)
+  }
+  assert.equal(requests.length, 2)
+})
+
 test("legacy speed migration handles binary, Blob and Request bodies without consuming originals", async (t) => {
   const { requests } = mockAPI(t, { entries: [{ id: "chat-model", service_tiers: ["priority"] }] })
   const plugin = await Sub2apiPlugin()
@@ -445,7 +493,8 @@ test("real speed-suffixed IDs take precedence and unsupported migrations never s
   ]) {
     await assert.rejects(loader.fetch(BASE + "/v1/responses", { body: JSON.stringify({ model, service_tier }) }), error)
   }
-  found["gpt-unknown"].serviceTiers.push("priority")
+  assert.deepEqual(found["gpt-unknown"].serviceTiers, ["priority", "ultrafast"])
+  found["gpt-unknown"].serviceTiers.splice(0, 2, "priority")
   await assert.rejects(loader.fetch(BASE + "/v1/responses", { body: '{"model":"gpt-unknown-fast"}' }), /has not declared/)
   assert.equal(requests.length, 1)
 })
@@ -526,16 +575,22 @@ test("catalog error expiry retains legacy speed migration and the account model 
   assert.equal(modelCalls, 2)
 })
 
-test("manifest failures do not reuse stale speed support or hide available models", async (t) => {
+test("manifest failure removes stale tiers and migration eligibility but not the listed GPT or its manual choices", async (t) => {
   let failed = false
-  mockAPI(t, { manifest: () => failed ? new Response(null, { status: 503 }) : Response.json({ models: [{ slug: "gpt-test", service_tiers: ["ultrafast"] }] }) })
+  const { requests } = mockAPI(t, { manifest: () => failed ? new Response(null, { status: 503 }) : Response.json({ models: [{ slug: "gpt-test", service_tiers: ["flex", "ultrafast"] }] }) })
   const plugin = await Sub2apiPlugin({}, { query: { modelsTtlMs: 0, effortsTtlMs: 0 } })
   const first = await plugin.provider.models(provider, { auth: account() })
-  assert.deepEqual(first["gpt-test"].serviceTiers, ["ultrafast"])
+  assert.deepEqual(first["gpt-test"].serviceTiers, ["flex", "ultrafast", "priority"])
+  const loader = await plugin.auth.loader(async () => account())
+  const init = { method: "POST", body: '{"model":"gpt-test-ultrafast"}' }
+  await loader.fetch(BASE + "/v1/responses", init)
+  assert.deepEqual(JSON.parse(requests[0].init.body), { model: "gpt-test", service_tier: "ultrafast" })
   failed = true
   const refreshed = await plugin.provider.models({ models: first }, { auth: account() })
   assert.deepEqual(Object.keys(refreshed), ["gpt-test"])
-  assert.deepEqual(refreshed["gpt-test"].serviceTiers, [])
+  assert.deepEqual(refreshed["gpt-test"].serviceTiers, ["priority", "ultrafast"])
+  await assert.rejects(loader.fetch(BASE + "/v1/responses", init), /has not declared/)
+  assert.equal(requests.length, 1)
 })
 
 test("unsupported-tier responses and network failures return once without model, key or speed fallback", async (t) => {
@@ -555,14 +610,17 @@ test("unsupported-tier responses and network failures return once without model,
 
 test("same-name models retain per-key speed support even with host metadata from a different account", async (t) => {
   const { queries, requests } = mockAPI(t, {
-    manifest: ({ headers }) => Response.json({ models: [{ slug: "gpt-test", service_tiers: headers.get("authorization") === "Bearer key-a" ? ["priority", "ultrafast"] : ["priority"] }] }),
+    entries: ({ headers }) => headers.get("authorization") === "Bearer key-a" ? ["gpt-test", "gpt-key-a-only"] : ["gpt-test"],
+    manifest: ({ headers }) => Response.json({ models: [{ slug: "gpt-test", service_tiers: headers.get("authorization") === "Bearer key-a" ? ["flex", "ultrafast"] : ["priority"] }] }),
   })
   const plugin = await Sub2apiPlugin()
-  const accounts = [account("key-a", BASE + "/a"), account("key-b", BASE + "/b")]
+  const accounts = [account("key-a"), account("key-b")]
   const first = await plugin.provider.models(provider, { auth: accounts[0] })
   const second = await plugin.provider.models({ models: first }, { auth: accounts[1] })
-  assert.deepEqual(first["gpt-test"].serviceTiers, ["priority", "ultrafast"])
-  assert.deepEqual(second["gpt-test"].serviceTiers, ["priority"])
+  assert.deepEqual(Object.keys(first), ["gpt-test", "gpt-key-a-only"])
+  assert.deepEqual(Object.keys(second), ["gpt-test"])
+  assert.deepEqual(first["gpt-test"].serviceTiers, ["flex", "ultrafast", "priority"])
+  assert.deepEqual(second["gpt-test"].serviceTiers, ["priority", "ultrafast"])
   assert.equal(queries.length, 4)
   for (const [index, tier] of [[1, "priority"], [0, "ultrafast"], [0, "priority"], [1, undefined]]) {
     const loader = await plugin.auth.loader(async () => accounts[index])
@@ -577,7 +635,7 @@ test("same-name models retain per-key speed support even with host metadata from
 test("real HTTP uses one original model with per-key tier discovery, Agent choice and unchanged SSE usage", async (t) => {
   const calls = []
   const server = createServer(async (req, res) => {
-    const tiers = req.headers.authorization === "Bearer key-a" ? ["priority", "ultrafast"] : ["priority"]
+    const tiers = req.headers.authorization === "Bearer key-a" ? ["flex", "priority", "ultrafast"] : ["priority"]
     if (req.url.endsWith("/v1/models")) { res.end(JSON.stringify({ data: [{ id: "gpt-test", service_tiers: tiers }] })); return }
     if (!req.url.endsWith("/v1/responses")) { res.writeHead(404).end(); return }
     let text = ""
@@ -601,8 +659,8 @@ test("real HTTP uses one original model with per-key tier discovery, Agent choic
   const catalogs = await Promise.all(accounts.map((auth) => plugin.provider.models(provider, { auth })))
   const loaders = await Promise.all(accounts.map((auth) => plugin.auth.loader(async () => auth)))
   for (const found of catalogs) assert.deepEqual(Object.keys(found), ["gpt-test"])
-  assert.deepEqual(catalogs[0]["gpt-test"].serviceTiers, ["priority", "ultrafast"])
-  assert.deepEqual(catalogs[1]["gpt-test"].serviceTiers, ["priority"])
+  assert.deepEqual(catalogs[0]["gpt-test"].serviceTiers, ["flex", "priority", "ultrafast"])
+  assert.deepEqual(catalogs[1]["gpt-test"].serviceTiers, ["priority", "ultrafast"])
   for (const [index, tier] of [[0, "ultrafast"], [1, "priority"], [0, undefined]]) {
     const response = await loaders[index].fetch(accounts[index].metadata.baseURL + "/v1/responses", {
       method: "POST", body: JSON.stringify({ model: "gpt-test", stream: true, ...(tier ? { service_tier: tier } : {}) }),

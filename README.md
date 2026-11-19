@@ -10,10 +10,10 @@
 
 - **套餐和用量**：读取 `GET /v1/usage`，显示套餐名、到期时间、日/周/月额度，或 key 总额度及限速窗口。
 - **余额**：余额计费的 key 显示钱包余额，包括零余额。
-- **模型列表**：自动读取 `GET /v1/models` 的思考等级和快速档位；含 Responses 模型时自动通过同一 key 的 `GET /backend-api/codex/models` 补充缺失信息，无需开启额外选项。辅助接口不可用时保留已知思考等级或使用默认值，不猜测快速权限。
+- **模型列表**：从 `GET /v1/models` 读取思考等级和服务档位；目录含 Responses 模型时，用同一 key 的 `GET /backend-api/codex/models` 补充缺失字段。
 - **账号绑定**：完整列出每个 API key 返回的模型，支持分页；发送使用所选账号自己的 Base URL、API key 和请求头，不在插件内切换 key 或模型。
 - **Gemini 自动协议选择**：自动模式在获取模型时只读探测原生目录；明确不支持原生入口时改用 OpenAI Chat Completions，由 Magpie 完成协议转换，不重发生成请求。
-- **原模型速度选择**：读取当前 key 报告的 Fast / Ultraspeed 能力，以 `serviceTiers` 交给 Magpie；兼容 omp、pi、Claude Code 等客户端已发送的原生速度参数，Anthropic fast 自动补齐兼容 beta 头，不额外生成模型或默认开启加速。
+- **快速与极速**：当前 key 已列出且使用 Responses 或 Chat Completions 的 GPT，默认可在原模型上选快速或极速。普通请求不加速，菜单不代表上游权限。Anthropic fast 仍使用原生参数和兼容 beta 头。
 - **请求指标**：保留四种协议的用量、缓存和流式事件，由 Magpie 原生统计耗时、首响应、token、缓存命中率、输出速度和估算费用，不重复上报账单。
 - **请求头**：支持全局、站点和账号级配置，查询及实际模型发送均生效，大小写不敏感地合并。
 - **多站点/多账号**：可共用 `sub2api` 池，也可配置最多 8 个独立站点 provider。
@@ -313,15 +313,13 @@ Magpie 的账号级 `baseURL` 优先于模型地址，因此发送函数还会�
 
 数值仅为配置示例，须按站点实际能力和计价填写。覆盖项只应用于 key 本来就能查询到的模型，不会凭空添加权限。全局 < 站点 < 账号元数据；筛选数组逐层替换，名称逐 ID 合并，覆盖元数据深度合并。可覆盖 `name`、`limit`、`cost`、`capabilities`、`options`、`headers`、`variants`、`release_date`、`status` 和 `serviceTiers`，但不能改模型身份、API 地址或账号凭据。`serviceTiers` 数组逐层替换。额外模型请求头仍接受保留头校验。显式协议继续使用 `modelProtocols`。
 
+**思考等级**不由价格或速度决定。显式 `modelOverrides` 优先；否则采用当前 key 的 `/v1/models` 返回的具体等级，其次是同一 key 的 Codex manifest，再保留宿主已有等级。如果仍没有具体等级（包括只返回 `none`），已识别的推理模型交给 Magpie 按模型 ID 查目录，不固定成低、中、高三档。站点明确列出的档位不会被扩大；宿主查到的档位不是上游支持的证明。宿主也不认识的模型不会凭空增加高档。
+
 ### 在原模型上选择 Fast / Ultraspeed
 
-能力读取不限定模型家族：Claude、Gemini、DeepSeek、Qwen 和自定义别名均读取主列表报告的思考等级。主列表只报告 `reasoning: true` 或 `capabilities.reasoning: true` 而未提供等级时，使用默认思考等级；没有能力声明的未知模型不强行标记为思考模型。快速服务档位同样逐模型读取，但只有使用 OpenAI 兼容协议时才声明 `serviceTiers`，不把 Anthropic/Gemini 原生速度参数混用为 OpenAI 服务档位。
+若模型由当前 key 的 `/v1/models` 列出，实际走 Responses 或 Chat Completions，且上游模型 ID 的最后一个 `/` 片段以 `gpt-` 或 `chatgpt-` 开头（不区分大小写），插件默认保留有效的上游档位，并在原模型的 `serviceTiers` 中补齐快速（`priority`）和极速（`ultrafast`）。上游档位缺失、为空、无效或只报告一档时，仍向宿主提供这两个选项；显式配置可以限制或关闭它们。其他模型在这两种协议上仍只采用当前 key 报告或显式声明的档位；原生 Anthropic/Gemini 不提供 OpenAI 服务档位。
 
-思考等级优先采用主列表的 `supported_reasoning_levels`（字符串或 `{ "effort": "high" }` 数组），其次采用辅助 Codex manifest，然后保留宿主已有等级；都没有时，GPT-5 及后续数字代际、o 系列和其他已识别思考模型默认使用 `low` / `medium` / `high`。`modelOverrides` 仍可显式覆盖。默认等级只是兼容回退，不代表站点已验证支持；不会自动添加 `xhigh`。
-
-若 Codex 没有显示思考等级或 `/fast`，请先更新 Magpie、重载插件并重新同步客户端模型目录，再重启 Codex。使用 `model_catalog_json` 时应检查该 JSON 中对应模型的 `supported_reasoning_levels` 和 `service_tiers`；只刷新网关模型列表未必会更新客户端正在读取的文件。快速档位来源均缺失时保持不展示；确认上游权限后可按下文显式配置，不会发送收费探测请求。
-
-模型列表只保留站点返回的真实 ID。插件把当前 key 报告的服务档位写入原模型的 `serviceTiers`，由 Magpie 提供给支持速度选择的 Agent（例如支持服务档位目录的 Codex）。不生成 `-fast` / `-ultraspeed` 模型，不更改原模型的 ID、思考等级或默认速度。显示名末尾的 `(fast)` / `（fast）`、`(ultraspeed)`、`(ultrafast)` 等速度标签会移除（包括站点、宿主缓存和自定义名称）；真实 ID 本身不清理，速度能力仅通过参数元数据声明，不根据标签推断支持。
+这是给宿主的手动选项，不是上游授权。普通请求不加速度参数，不探测加速权限，也不生成 `-fast` / `-ultraspeed` 模型。例如，只有站点为当前 key 列出 `gpt-6.2-astra` 后，刷新目录才会给它补齐这两个档位。显示名末尾的 `(fast)`、`(ultraspeed)` 等速度标签（含全角括号）会移除；判断依据是原始 ID，不是显示名。
 
 | Agent 选择 | OpenAI 兼容请求参数 | 发给上游的模型 ID |
 | --- | --- | --- |
@@ -337,24 +335,22 @@ Magpie 的账号级 `baseURL` 优先于模型地址，因此发送函数还会�
 
 Magpie 选择账号后，上游收到的 `model` 是 `gpt-example`，速度参数保持 `priority`。`ultraspeed` 是配置别名，线上参数使用 `ultrafast`，不是 `service_tier: "ultraspeed"`。
 
-- **仅报告有依据的能力**：优先读取当前 key 的 `/v1/models` 中的 `service_tiers` / `serviceTiers`，支持字符串或 `{ "id": "priority" }` 数组。含 Responses 模型时，缺失字段可由同一 key 的 `/backend-api/codex/models` 补充。主列表明确返回空数组、`null` 或无效值时，不从辅助 manifest 补回权限。
-- 没有速度元数据时，不按 GPT 名称、套餐名、协议或其他 key 的模型信息推断支持，也不发起收费探测。可选 manifest 的非 401 失败不隐藏原模型，但不会把上次的速度能力当成一次成功刷新的当前结果；401 仍作为登录失效处理。能力展示是否准确仍取决于站点报告，不能替代上游权限校验。
-- 站点未报告、但你已确认某个 key 支持时，可以为原模型显式声明。以下配置也可放在站点选项或账号 `metadata` 中；同名模型在不同 key 上权限不同时，优先账号级配置：
+- **上游报告**：优先读取当前 key 主目录的 `service_tiers` / `serviceTiers`（字符串或 `{ "id": "priority" }` 对象组成的数组）。只有字段缺失时才从同一 key 的 Codex manifest 补充；主目录明确为空数组、`null` 或无效值时，不采用 manifest 档位。其他 key 或宿主合并的档位不是该账号的报告。
+- **显式覆盖**：`modelOverrides.<id>.serviceTiers` 替换整个档位列表；未设置时，旧 `speedModels` 对象中针对该 ID 的声明也可替换列表。两种声明都不再补齐 GPT 默认档，显式 `[]` 关闭展示。配置按全局 < 站点 < 账号 `metadata` 生效，数组逐层替换；不同 key 需要不同选项时按账号配置。以下示例只提供快速：
 
 ```json
 {
   "modelOverrides": {
-    "gpt-example": {"serviceTiers": ["priority", "ultrafast"]}
+    "gpt-example": {"serviceTiers": ["priority"]}
   }
 }
 ```
 
-- `serviceTiers` 只声明能力，不自动启用速度；空数组明确关闭展示，支持 `fast` → `priority`、`ultraspeed` → `ultrafast` 配置别名。全局 < 站点 < 账号，数组逐层替换。声明不会添加 key 未列出的模型或授予真实权限。
+- **旧数组筛选**：旧 `speedModels` 数组在最后筛选加速档，包括 GPT 默认补齐的档位；它不声明支持，不影响其他档位。`fast` 对应 `priority`，`ultraspeed` 对应 `ultrafast`。
 - 此选择机制用于 Responses / Chat Completions 的 `service_tier`。Anthropic 的原生 `speed: "fast"` 参数保持不变，并在缺少时向最终 `anthropic-beta` 追加 `fast-mode-2026-02-01`，保留已有 beta、不重复追加；`speed: "standard"` 或未选择 fast 时不添加。官方 Claude 保留原始正文，第三方 Claude 仅执行上文说明的身份正文补全，不改变速度。只处理 `/messages` 推理，不作用于 token 统计、管理接口或其他协议，不把 Anthropic/Gemini 模型伪装成支持 OpenAI 服务档位；对这些协议显式配置非空 `serviceTiers` 会报错。站点以 OpenAI 兼容协议提供同一模型时，可按实际情况设置 `modelProtocols`。
 - 每次请求仍使用所选账号自己的 Base URL、key 和协议路径。标准请求不改写 Agent 选择的模型或速度，不注入默认速度、不预读响应流；不支持时直接返回原始上游错误，不降档、不重试、不换 key 或模型。
-- 需要支持插件 `serviceTiers` 的 Magpie 版本，以及能读取目录和发送对应参数的 Agent。不是所有客户端都会自动出现速度菜单；不支持菜单的客户端可自行设置标准请求参数。宿主在请求到达插件之前可能有自己的参数转换、账号重试或回退；端到端禁止回退须单独关闭这些宿主策略，插件不修改宿主配置。
-- 升级后请重载插件和模型列表，并将原来的合成速度模型选择、筛选、价格覆盖或路由引用改回原模型。为兼容已保存的旧选择，当请求 ID 不在当前 key 目录、去掉末尾 `-fast` / `-ultraspeed` / `-ultrafast` 后的原 ID 在目录中，且该 key 明确声明对应档位时，插件在首次发送前转换为原 ID 加 `service_tier`（Fast 为 `priority`，另两者为 `ultrafast`）。例如 `gpt-6.1-sol-fast` 转为 `gpt-6.1-sol` 加 `service_tier: "priority"`，不增加目录模型，也不在失败后重试。真实存在的完整 ID 优先，绝不去后缀；不猜测空格、连字符或其他别名。能力未知、参数冲突或非 OpenAI 兼容协议直接报错。兼容转换仅处理大小受限的可读 JSON，流式上传不改写；旧合成模型的私有请求头标记仍明确报错，需刷新模型列表。
-- 旧 `speedModels` 不再创建模型：数组仅筛选已报告的加速档，不能凭空声明支持；对象仍兼容按原 ID 显式声明能力，建议迁移到 `modelOverrides.<原模型>.serviceTiers`。默认配置和示例不再包含此旧选项。
+- **查看新选项**：重载更新后的本地插件，在 Magpie 重新获取目标账号的模型，再同步客户端目录。若 Codex 仍缺少 `/fast` 或思考等级，请更新 Magpie；如使用 `model_catalog_json`，检查对应模型的 `service_tiers` 和 `supported_reasoning_levels`，再重启 Codex。显示菜单需要宿主和客户端支持；没有菜单的客户端仍可显式发送标准参数。若需禁止端到端回退，请单独关闭宿主重试和回退策略。
+- **旧合成 ID 迁移**：建议把旧选择、筛选、价格或路由引用改回原模型。真实目录若已列出完整 ID，绝不去后缀；否则，仅当去掉 `-fast` / `-ultraspeed` / `-ultrafast` 后的原 ID 在当前账号目录中，且同一账号上游报告或适用的显式逐模型配置声明了对应档位，才在发送前改为原 ID 加 `service_tier`。**GPT 默认补出的菜单档位不足以触发迁移。** 未知或被筛除的档位、参数冲突和非 OpenAI 兼容协议均报错。不猜测其他别名，不改写流式上传；转换只处理大小受限的可读 JSON。旧合成模型的私有请求头仍会报错，需刷新目录。
 - 原模型价格和用量元数据继续保留。速度可能影响收费；若宿主使用同一套模型单价估算所有速度档，不应把该估算当作加速档实际账单，请以站点计价和实际用量为准。
 
 ### omp、pi、Claude Code 与其他 Agent
@@ -398,7 +394,7 @@ Magpie 选择账号后，上游收到的 `model` 是 `gpt-example`，速度参�
 
 - TTL 为毫秒，设为 `0` 禁用完成结果缓存，但仍合并正在进行的相同查询；TTL 最大 1 小时。缓存是有效期内的成功结果复用，不是失败后的旧数据回退。缓存最多 128 项，超出逐出较早条目。
 - 普通查询超时和思考等级查询超时分别可设为 1–60000 毫秒；JSON 大小可设为 1 字节到 64 MiB，默认 4 MiB，并检查声明长度和实际读取长度。
-- 只有含 Responses 模型的列表才查询 Codex manifest，默认最多额外等 15 秒，避免较慢站点的能力查询被误降级为三个默认等级且不显示 Fast；非 401 失败后 30 秒内不重复探测，保留已知思考等级。图标发现和模型发现互不阻塞。
+- 只有含 Responses 模型的列表才查询 Codex manifest，默认最多额外等 15 秒。非 401 失败后 30 秒内不重复查询，保留已知思考等级，不把旧 manifest 的档位当作本次报告。图标发现和模型发现互不阻塞。
 - 当前主模型目录/辅助 manifest 刷新或用量查询观察到的 401 会标记需要登录，不影响其他 key；独立用量查询后到的 401 仍生效，不会被先完成的模型刷新忽略。每次普通目录错误阻断推理 30 秒，缓存命中不会延长该期限；被较新模型刷新替代的旧结果不能重建过时错误。401 会清除该凭据作用域的查询缓存，其他失败不作为成功缓存，没有管理查询或计费请求的自动重试。
 - 自动 Gemini 的原生目录探测使用同一查询超时和缓存约束，`protocol.selected` 记录原生/兼容协议选择；不确定的可选结果不冒充已经验证的协议能力，不影响主目录的真实性。
 - 开启 `diagnostics: true` 可查看固定事件名、协议、耗时、数量、缓存命中和 HTTP 状态，并通过凭据作用域的摘要 `accountRef` 关联目录与发送。`inference.model_rejected` 表示本地模型/账号不匹配，含模型来源和目录数量，不代表上游返回 HTTP 错误。日志不包含账号名、模型名、站点 URL、请求体、响应体或请求头值。管理接口错误不回显站点返回的内容，避免反射密钥。
@@ -447,7 +443,7 @@ npm test
 npm pack --dry-run
 ```
 
-测试无需 API key、npm 依赖或 Docker。覆盖套餐、余额、分页全量模型、模型元数据保留、请求头覆盖顺序、账号隔离、四种协议、显式别名、协议路径重写、Gemini 认证、请求体/取消信号保留、URL 安全、失败不回退、查询缓存/体积/超时限制，以及图标发现和凭据隔离。速度测试验证无额外模型、当前 key 的服务档位发现、元数据优先级、未知能力不推断、原模型速度参数透传、并发隔离及旧选择迁移。指标测试验证四种协议的 JSON/SSE 用量、缓存与 reasoning 字段不丢失、流不被预读、未知价格不造零。真实 loopback HTTP 测试覆盖多 key 对应地址和凭据、原模型速度选择、SSE、取消、图标获取与重定向拒绝；环境禁止监听本地端口时会明确跳过相关项。CI 在 Linux/macOS 和 Node.js 20/22/24 上运行相同检查、测试和打包预览。
+测试无需 API key、npm 依赖或 Docker。覆盖套餐、余额、分页全量模型、模型元数据保留、请求头覆盖顺序、账号隔离、四种协议、显式别名、协议路径重写、Gemini 认证、请求体/取消信号保留、URL 安全、失败不回退、查询缓存/体积/超时限制，以及图标发现和凭据隔离。速度测试覆盖按 key 读取档位、仅在已列出的 OpenAI 协议 GPT 上补齐两档、显式覆盖与筛选、普通请求不加速、所选参数透传、账号隔离，以及旧合成 ID 不因 GPT 默认档而迁移。指标测试验证四种协议的 JSON/SSE 用量、缓存与 reasoning 字段不丢失、流不被预读、未知价格不造零。真实 loopback HTTP 测试覆盖多 key 对应地址和凭据、原模型速度选择、SSE、取消、图标获取与重定向拒绝；环境禁止监听本地端口时会明确跳过相关项。CI 在 Linux/macOS 和 Node.js 20/22/24 上运行相同检查、测试和打包预览。
 
 恢复回归还覆盖普通错误 TTL 后的旧速度 ID 迁移、迟到刷新/401 的完成顺序、缓存淘汰后的鉴权失效；身份测试覆盖官方请求透传、第三方 Claude 严格正文补全、Codex 头兼容、会话稳定性、账号隔离，以及超时不转发 JSON 前缀。
 

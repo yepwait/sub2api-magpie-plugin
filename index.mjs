@@ -82,6 +82,8 @@ const QUERY_DEFAULTS = {
 const CACHE_MAX = 128
 const LEGACY_SPEED_HEADERS = ["x-sub2api-magpie-plugin-speed-model", "x-magpie-sub2api-speed-model"]
 const SPEEDS = { fast: "priority", ultraspeed: "ultrafast" }
+const SPEED_TIERS = Object.values(SPEEDS)
+const GPT_SLUG = /^(?:chat)?gpt-/
 const ANTHROPIC_FAST_BETA = "fast-mode-2026-02-01"
 // A sub2api site restricted to official Claude clients (claude_code_only) runs
 // the Messages body through ClaudeCodeValidator.Validate
@@ -501,12 +503,16 @@ function protocolHeadersOf(...layers) {
   return out
 }
 
+function modelSlug(id) {
+  return id.slice(id.lastIndexOf("/") + 1).toLowerCase()
+}
+
 function modelProtocol(id, routing) {
   const protocol = routing.modelProtocols[id] ?? routing.protocol
   if (protocol !== "auto") return protocol
-  const s = id.toLowerCase().split("/").at(-1)
+  const s = modelSlug(id)
   if (/^claude[-.]/.test(s) || id.toLowerCase().startsWith("anthropic/")) return "anthropic"
-  if (/^(gpt-|o\d|codex-|chatgpt-)/.test(s)) return "responses"
+  if (GPT_SLUG.test(s) || /^(o\d|codex-)/.test(s)) return "responses"
   if (/^gemini[-.]/.test(s)) return "gemini"
   return "chat-completions"
 }
@@ -613,20 +619,21 @@ function modelServiceTiers(model, manifest, selection, protocol) {
   const legacy = selection.speedModels
   const legacyConfigured = legacy && !Array.isArray(legacy) && Object.hasOwn(legacy, model.id)
   const declared = configured ?? (legacyConfigured ? legacy[model.id] : undefined)
-  let tiers = serviceTiers(declared ?? reportedTiers(model) ?? manifest?.serviceTiers)
-  // Native service_tier selection is supported on OpenAI-compatible APIs.
-  // Never borrow account eligibility from the host's merged model metadata.
   if (!["responses", "chat-completions"].includes(protocol)) {
-    if (tiers.length && declared !== undefined) {
+    if (declared?.length) {
       throw new Error("Service tier selection requires an OpenAI-compatible API protocol")
     }
-    return []
+    return { choices: [], migrationTiers: [] }
   }
-  if (Array.isArray(legacy)) {
-    const allowed = legacy.map((speed) => SPEEDS[speed])
-    tiers = tiers.filter((tier) => !Object.values(SPEEDS).includes(tier) || allowed.includes(tier))
-  }
-  return tiers
+  const allowed = Array.isArray(legacy) ? legacy.map((speed) => SPEEDS[speed]) : SPEED_TIERS
+  const migrationTiers = serviceTiers(declared ?? reportedTiers(model) ?? manifest?.serviceTiers)
+    .filter((tier) => !SPEED_TIERS.includes(tier) || allowed.includes(tier))
+  // GPT speed buttons are opt-in requests, not evidence for migrating a saved
+  // speed-suffixed ID. Keep the public list separate from the account snapshot.
+  const choices = declared === undefined && GPT_SLUG.test(modelSlug(model.id))
+    ? [...new Set([...migrationTiers, ...allowed])]
+    : [...migrationTiers]
+  return { choices, migrationTiers }
 }
 
 function validatePrices(selection) {
@@ -816,8 +823,8 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}, report = ()
       if (!original || !state.ids.has(original)) {
         throw modelAccountMismatch(state, protocol, "body", report)
       }
-      if (!["responses", "chat-completions"].includes(protocol) || !state.tiers?.get(original)?.includes(tier)) {
-        throw new Error("Legacy speed model cannot be migrated: this account has not declared the requested service tier; select the original model and verify its serviceTiers")
+      if (!["responses", "chat-completions"].includes(protocol) || !state.migrationTiers?.get(original)?.includes(tier)) {
+        throw new Error("Legacy speed model cannot be migrated: this account has not declared the requested service tier; use the original model ID and select its speed explicitly")
       }
       if (payload.service_tier !== undefined && payload.service_tier !== tier) {
         throw new Error("Legacy speed model conflicts with the explicit service_tier; select the original model and one service tier")
@@ -1182,9 +1189,6 @@ function queries(onExpired) {
 
 // ---- models -------------------------------------------------------------------
 
-// LEVELS are a thinking model's reasoning levels when nothing tells them.
-const LEVELS = ["low", "medium", "high"]
-
 const variantsOf = (levels) => Object.fromEntries(levels.map((l) => [l, {}]))
 
 function reasoningLevels(model) {
@@ -1204,11 +1208,8 @@ function modelDisplayName(name, id) {
   return clean.trim() ? clean : id
 }
 
-// runtimeModel is magpie's model. Its variants are its reasoning levels
-// (magpie offers a thinking model's variants' keys as its efforts), the
-// first of: the primary/manifest levels the site tells (told), the variants magpie already
-// has for the model (was: models.dev's, the config's), LEVELS when the
-// model thinks.
+// Magpie looks up a reasoning model's efforts by ID if its variants are empty.
+// A guessed list here would mask the host catalog, including its higher efforts.
 function runtimeModel(m, url, providerID, told, was, npm, override = {}) {
   const kept = was?.variants && typeof was.variants === "object" && Object.keys(was.variants).length ? was.variants : undefined
   const reasoning = m.reasoning === true || !!told?.length || !!kept || /think|reason|(?:^|\/)(?:o\d|gpt-(?:[5-9]|[1-9]\d+)(?:[.-]|$)|codex-)/i.test(m.id)
@@ -1231,7 +1232,7 @@ function runtimeModel(m, url, providerID, told, was, npm, override = {}) {
       interleaved: false,
     },
     release_date: "",
-    variants: told?.length ? variantsOf(told) : (kept ?? (reasoning ? variantsOf(LEVELS) : {})),
+    variants: {},
   }
   const out = mergeModel(defaults, was, override)
   // Account ownership and transport are never inherited from another source.
@@ -1328,6 +1329,7 @@ async function models(id, base, auth, was, extra, routing, settings, selection, 
       ? codexModels(query, base, auth.key, extra, settings, report) : {},
   ])
   const out = Object.create(null)
+  const migrationTiers = new Map()
   for (const m of visible) {
     const display = selection.modelNames[m.id] ?? m.display_name ?? m.name
     const named = typeof display === "string" && !!display
@@ -1335,10 +1337,12 @@ async function models(id, base, auth, was, extra, routing, settings, selection, 
     const protocol = automaticGemini(m.id) ? geminiProtocol : modelProtocol(m.id, routing)
     out[m.id] = runtimeModel({ id: m.id, name, named, reasoning: m.reasoning === true || m.capabilities?.reasoning === true }, base + routing.apiPaths[protocol].replace(/\/+$/, ""), id, reasoningLevels(m) ?? told[m.id]?.levels, was?.[m.id], PROTOCOLS[protocol], selection.modelOverrides[m.id])
     out[m.id].name = modelDisplayName(selection.modelNames[m.id] ?? out[m.id].name, m.id)
-    out[m.id].serviceTiers = modelServiceTiers(m, told[m.id], selection, protocol)
+    const tiers = modelServiceTiers(m, told[m.id], selection, protocol)
+    out[m.id].serviceTiers = tiers.choices
+    migrationTiers.set(m.id, tiers.migrationTiers)
   }
   report("models.ready", { discovered: entries.length, visible: Object.keys(out).length })
-  return out
+  return { models: out, migrationTiers }
 }
 
 // ---- usage --------------------------------------------------------------------
@@ -1647,7 +1651,7 @@ function hooks(client, id, site, options) {
         // Cosmetic discovery must not hold up the account's model catalog.
         void refreshIcon(base, true).catch(() => report("icon.failed"))
         try {
-          const found = await models(id, base, auth, provider?.models, headers, routing, settings, selection, query, report, protocolHeadersFor(auth))
+          const { models: found, migrationTiers } = await models(id, base, auth, provider?.models, headers, routing, settings, selection, query, report, protocolHeadersFor(auth))
           const currentAuth = authStates.get(scope)
           if (currentAuth?.error && currentAuth.error !== authAtStart?.error) throw currentAuth.error
           if (currentAuth && currentAuth !== authAtStart && catalogs.get(catalogKey) !== catalog) {
@@ -1657,7 +1661,7 @@ function hooks(client, id, site, options) {
             cacheSet(authStates, scope, { error: currentAuth?.error, expired: false })
             cacheSet(catalogs, catalogKey, {
               ids: new Set(Object.keys(found)),
-              tiers: new Map(Object.entries(found).map(([model, metadata]) => [model, [...metadata.serviceTiers]])),
+              migrationTiers,
             })
           }
           return found
